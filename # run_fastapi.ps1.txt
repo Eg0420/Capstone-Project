@@ -1,0 +1,31 @@
+# run_fastapi.ps1
+
+# 1️⃣ Set project root
+$projectRoot = "C:\Users\harsh\Downloads\clone\Capstone-Project"
+Set-Location $projectRoot
+
+# 2️⃣ Create virtual environment if missing
+if (-Not (Test-Path ".\venv")) {
+    Write-Host "Creating virtual environment..."
+    python -m venv venv
+}
+
+# 3️⃣ Activate virtual environment
+Write-Host "Activating virtual environment..."
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+$venvActivate = Join-Path $projectRoot "venv\Scripts\Activate.ps1"
+. $venvActivate
+
+# 4️⃣ Install required packages
+Write-Host "Installing required packages..."
+pip install --upgrade pip
+pip install fastapi uvicorn sqlalchemy
+
+# 5️⃣ Start FastAPI server
+Write-Host "Starting FastAPI server..."
+Start-Process powershell -ArgumentList "uvicorn app.main:app --reload"
+
+# 6️⃣ Open Swagger UI in default browser
+Start-Sleep -Seconds 2
+Start-Process "http://127.0.0.1:8000/docs"
+Write-Host "Server started and docs opened in browser!"
