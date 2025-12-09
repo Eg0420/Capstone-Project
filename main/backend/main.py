@@ -1,4 +1,6 @@
 from fastapi import FastAPI
+from notebooks import vyber_ai_mood_recommender
+
 
 app = FastAPI()
 
@@ -12,4 +14,5 @@ def mood_input(data: dict):
 
 @app.get("/recommendations")
 def recommendations(mood: str):
-    return {"mood": mood, "results": []}  # temporary
+    movies = vyber_ai_mood_recommender(mood)
+    return {"mood": mood, "results": movies}
