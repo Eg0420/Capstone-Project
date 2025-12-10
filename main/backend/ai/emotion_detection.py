@@ -1,14 +1,16 @@
 """Emotion detection and movie recommendation utilities for Vyber.
 
-This module exposes three main helpers for the FastAPI backend:
+This module exposes helpers for the FastAPI backend:
 
-- load_movies()        → returns the movies DataFrame with ratings and genres
-- detect_mood(text)    → maps free-text input to one of our moods
-- recommend(mood, ...) → returns a list of recommended movie titles with explanations
+- load_movies()         → returns the movies DataFrame with ratings and genres
+- detect_mood(text)     → maps free-text input to one of our moods
+- recommend(mood, ...)  → returns a list of recommended movies for a mood
+- surprise_me(mood, ...)→ returns one "surprise" movie using vibe clusters
 """
 
 import os
 import ast
+import random
 import numpy as np
 import pandas as pd
 from transformers import pipeline
@@ -23,7 +25,7 @@ TFIDF_VECTORIZER_PATH = os.path.join(MODELS_DIR, "tfidf_vectorizer.pkl")
 COSINE_SIM_MATRIX_PATH = os.path.join(MODELS_DIR, "cosine_sim_matrix.npy")
 MOVIES_DF_PATH = os.path.join(MODELS_DIR, "loaded_movies_df.csv")
 
-# Load TF-IDF vectorizer (kept for future use)
+# Load TF-IDF vectorizer (kept for future use / compatibility)
 tfidf_vectorizer = joblib.load(TFIDF_VECTORIZER_PATH)
 
 # Load cosine similarity matrix
@@ -49,6 +51,12 @@ def _ensure_genres_list(val):
 
 if "genres" in movies_df.columns:
     movies_df["genres"] = movies_df["genres"].apply(_ensure_genres_list)
+
+# Ensure vibe_cluster column exists and is integer (for KMeans clustering)
+if "vibe_cluster" in movies_df.columns:
+    movies_df["vibe_cluster"] = movies_df["vibe_cluster"].fillna(-1).astype(int)
+else:
+    movies_df["vibe_cluster"] = -1
 
 # --- Emotion model and mapping ---
 
@@ -85,56 +93,33 @@ emotion_to_mood_map = {
 # Fallback if nothing matches
 DEFAULT_MOOD = "happy"
 
-# Mood → genres mapping (optimized)
+# Mood → genres mapping
 mood_to_genres_map = {
-    "happy": [
-        "Comedy",
-        "Family",
-        "Animation",
-        "Romance"
-    ],
-    "sad": [
-        "Drama",
-        "Romance"
-    ],
-    "romantic": [
-        "Romance",
-        "Drama"
-    ],
-    "action": [
-        "Action",
-        "Adventure",
-        "Crime",
-        "Sci-Fi"
-    ],
-    "scary": [
-        "Horror",
-        "Thriller"
-    ],
-    "fantasy": [
-        "Fantasy",
-        "Sci-Fi",
-        "Animation",
-        "Adventure"
-    ]
+    "happy": ["Comedy", "Family", "Animation", "Romance"],
+    "sad": ["Drama"],
+    "romantic": ["Romance"],
+    "action": ["Action", "Adventure", "Crime", "Sci-Fi"],
+    "scary": ["Horror", "Thriller"],
+    "fantasy": ["Fantasy", "Sci-Fi", "Adventure"]
 }
 
 def load_movies():
     """Return the full movies DataFrame used by the recommender."""
     return movies_df.copy()
 
+# --- Helpers for emotion detection & explanations ---
+
 def _extract_top_dict(results):
     """Safely pull out the top {label, score} dict from any nested list structure."""
     obj = results
-    # Sometimes it's already a dict
     if isinstance(obj, dict):
         return obj
-    # If it's a list, keep going into the first element until we hit a dict or fail
     while isinstance(obj, list) and len(obj) > 0:
         obj = obj[0]
         if isinstance(obj, dict):
             return obj
     return None
+
 
 def detect_mood(text: str) -> str:
     """Detect a coarse mood (one of 6) from free-text input.
@@ -158,12 +143,98 @@ def detect_mood(text: str) -> str:
     mood = emotion_to_mood_map.get(label, DEFAULT_MOOD)
     return mood
 
-def recommend(mood: str, top_n: int = 5, weight_sim: float = 0.7, weight_rating: float = 0.3):
+
+def build_explanation(
+    title: str,
+    mood: str,
+    genres_list,
+    avg_rating: float = None,
+    rank: int = 1,
+    user_text: str = None,
+) -> str:
+    """Generate a natural-language explanation for a recommendation."""
+
+    mood = (mood or "").lower()
+
+    # Genre phrase
+    if genres_list:
+        main_genre = genres_list[0]
+        if len(genres_list) == 1:
+            genre_phrase = f"{main_genre} movie"
+        else:
+            others = ", ".join(genres_list[1:])
+            genre_phrase = f"{main_genre} movie with {others} elements"
+    else:
+        genre_phrase = "movie"
+
+    # Rating phrase
+    if avg_rating is not None:
+        rating_phrase = f", rated about {avg_rating:.1f} by other viewers"
+    else:
+        rating_phrase = ""
+
+    # Rank phrase
+    if rank == 1:
+        rank_phrase = " as a top pick for your mood"
+    elif rank == 2:
+        rank_phrase = " as another strong choice"
+    elif rank == 3:
+        rank_phrase = " as a good option to try next"
+    else:
+        rank_phrase = ""
+
+    # Optional snippet from user text
+    snippet = None
+    if isinstance(user_text, str) and user_text.strip():
+        cleaned = " ".join(user_text.strip().split())
+        if len(cleaned) > 80:
+            cleaned = cleaned[:77] + "..."
+        snippet = cleaned
+
+    # Template variations 
+    templates = [
+        "Since your mood is {mood}, we picked {title}, a {genre_phrase}{rating_phrase}{rank_phrase}.",
+        "Because you are feeling {mood}, {title} — a {genre_phrase}{rating_phrase} — should fit your vibe{rank_phrase}.",
+        "To go with your {mood} mood, we suggest {title}, which is a {genre_phrase}{rating_phrase}{rank_phrase}.",
+        "For this {mood} mood, {title} stands out as a {genre_phrase}{rating_phrase}{rank_phrase}.",
+        "Given that you are feeling {mood}, {title} is a {genre_phrase} that many people enjoy{rating_phrase}{rank_phrase}.",
+        "We matched your {mood} mood with {title}, a {genre_phrase}{rating_phrase}{rank_phrase}.",
+    ]
+
+    if snippet:
+        templates.extend([
+            'You mentioned "{snippet}", so we chose {title}, a {genre_phrase}{rating_phrase}{rank_phrase}.',
+            'Based on what you said ("{snippet}"), {title} — a {genre_phrase}{rating_phrase} — should suit your mood{rank_phrase}.',
+        ])
+
+    template = random.choice(templates)
+
+    explanation = template.format(
+        mood=mood,
+        title=title,
+        genre_phrase=genre_phrase,
+        rating_phrase=rating_phrase,
+        rank_phrase=rank_phrase,
+        snippet=snippet or "",
+    )
+
+    return explanation
+
+
+#Recommendation logic
+
+def recommend(
+    mood: str,
+    top_n: int = 5,
+    weight_sim: float = 0.7,
+    weight_rating: float = 0.3,
+    user_text: str = None,
+):
     """Recommend movies for a given mood.
 
     Combines cosine similarity (based on title + genres)
     and average rating to score movies, then returns a list
-    of dicts with title, genres, mood, rating, and explanation.
+    of dicts with title, genres, mood, rating, vibe_cluster, explanation.
     """
     mood = (mood or "").lower()
     if mood not in mood_to_genres_map:
@@ -216,11 +287,9 @@ def recommend(mood: str, top_n: int = 5, weight_sim: float = 0.7, weight_rating:
     top_movie_indices = [candidate_indices[i] for i in top_idx]
     top_movies = movies_df.loc[top_movie_indices]
 
-    # Build rich output: title, genres, mood, rating, explanation
     results = []
-    for _, row in top_movies.iterrows():
+    for rank, (_, row) in enumerate(top_movies.iterrows(), start=1):
         genres_val = row.get("genres", [])
-        # Make sure genres is a list for JSON
         if isinstance(genres_val, str):
             try:
                 parsed = ast.literal_eval(genres_val)
@@ -234,29 +303,125 @@ def recommend(mood: str, top_n: int = 5, weight_sim: float = 0.7, weight_rating:
             genres_val = [str(genres_val)]
 
         genres_list = [str(g) for g in genres_val if g is not None]
-        main_genre = genres_list[0] if genres_list else None
-
-        if main_genre:
-            explanation = (
-                f"Because you're feeling {mood}, we picked this {main_genre} movie "
-                f"that matches your current vibe."
-            )
-        else:
-            explanation = (
-                f"Because you're feeling {mood}, we picked this highly-rated movie "
-                f"that many people enjoy in this mood."
-            )
 
         avg_rating = None
         if "avg_rating" in row and not pd.isna(row["avg_rating"]):
             avg_rating = float(row["avg_rating"])
+
+        explanation = build_explanation(
+            title=row["title"],
+            mood=mood,
+            genres_list=genres_list,
+            avg_rating=avg_rating,
+            rank=rank,
+            user_text=user_text,
+        )
+
+        # Safe handling for vibe_cluster from the dataframe
+        if "vibe_cluster" in row:
+            vibe_val = row["vibe_cluster"]
+        else:
+            vibe_val = None
+
+        try:
+            vibe_cluster = int(vibe_val) if vibe_val is not None and not pd.isna(vibe_val) else None
+        except Exception:
+            vibe_cluster = None
 
         results.append({
             "title": row["title"],
             "genres": genres_list,
             "mood": mood,
             "avg_rating": avg_rating,
-            "explanation": explanation
+            "vibe_cluster": vibe_cluster,
+            "explanation": explanation,
         })
 
     return results
+
+
+def surprise_me(mood: str, user_text: str = None):
+    """
+    Surprise-me recommender that uses mood + vibe clusters.
+
+    - Picks movies for the mood (like recommend)
+    - Tries to choose one from a *different* vibe_cluster than the main top picks
+      so it feels fresh but still relevant.
+    """
+
+    # Normalize mood
+    mood = (mood or "").lower()
+    if mood not in mood_to_genres_map:
+        mood = DEFAULT_MOOD
+
+    # 1) Use existing recommend() to see the main clusters
+    base_recs = recommend(mood=mood, top_n=5, user_text=user_text)
+    base_clusters = {
+        r.get("vibe_cluster")
+        for r in base_recs
+        if r.get("vibe_cluster") is not None
+    }
+
+    # 2) Build candidate set: same mood’s genre filter
+    target_genres = mood_to_genres_map[mood]
+
+    def has_genre(genres):
+        if not isinstance(genres, (list, tuple, set)):
+            return False
+        genres_lower = [str(g).lower() for g in genres]
+        return any(tg.lower() in genres_lower for tg in target_genres)
+
+    mask = movies_df["genres"].apply(has_genre)
+    candidates_df = movies_df[mask].copy()
+    if candidates_df.empty:
+        candidates_df = movies_df.copy()
+
+    # 3) Prefer movies from a *different* vibe_cluster than main recs
+    if "vibe_cluster" in candidates_df.columns and base_clusters:
+        alt_candidates = candidates_df[~candidates_df["vibe_cluster"].isin(base_clusters)]
+        if not alt_candidates.empty:
+            candidates_df = alt_candidates
+
+    # 4) Randomly pick ONE surprise movie
+    surprise_row = candidates_df.sample(n=1, random_state=None).iloc[0]
+
+    # 5) Clean genres to a list of strings
+    genres_val = surprise_row.get("genres", [])
+    if isinstance(genres_val, str):
+        try:
+            parsed = ast.literal_eval(genres_val)
+            if isinstance(parsed, list):
+                genres_val = parsed
+            else:
+                genres_val = [genres_val]
+        except Exception:
+            genres_val = [genres_val]
+    elif not isinstance(genres_val, (list, tuple, set)):
+        genres_val = [str(genres_val)]
+
+    genres_list = [str(g) for g in genres_val if g is not None]
+
+    # 6) Get rating
+    avg_rating = None
+    if "avg_rating" in surprise_row and not pd.isna(surprise_row["avg_rating"]):
+        avg_rating = float(surprise_row["avg_rating"])
+
+    # 7) Reuse explanation system
+    explanation = build_explanation(
+        title=surprise_row["title"],
+        mood=mood,
+        genres_list=genres_list,
+        avg_rating=avg_rating,
+        rank=1,
+        user_text=user_text,
+    )
+
+    # 8) Return a single movie dict
+    return {
+        "title": surprise_row["title"],
+        "genres": genres_list,
+        "mood": mood,
+        "avg_rating": avg_rating,
+        "vibe_cluster": int(surprise_row["vibe_cluster"]) if "vibe_cluster" in surprise_row else None,
+        "explanation": explanation,
+    }
