@@ -1,0 +1,3 @@
+timestamp_utc,session_id,source,mood,raw_text,detected_label,score
+2025-12-11T15:03:59.467248,team_test,ai_detected,happy,i feel happy and chill,,
+2025-12-11T15:05:30.356833,team_test,ai_detected,happy,i feel happy and chill,,
