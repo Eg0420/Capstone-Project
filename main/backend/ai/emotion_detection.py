@@ -1,41 +1,129 @@
-"""Emotion detection and movie recommendation utilities for Vyber.
+"""
+Emotion detection and movie recommendation utilities for Vyber.
 
-This module exposes helpers for the FastAPI backend:
+This module exposes helpers for the backend & frontend:
 
-- load_movies()         → returns the movies DataFrame with ratings and genres
-- detect_mood(text)     → maps free-text input to one of our moods
-- recommend(mood, ...)  → returns a list of recommended movies for a mood
-- surprise_me(mood, ...)→ returns one "surprise" movie using vibe clusters
+- load_movies() → returns the movies DataFrame
+- detect_mood(text) → maps free-text input to one of our coarse moods
+- recommend(mood, ...) → returns a list of recommended movies
+- surprise_me(mood, ...) → returns one "surprise" movie using vibe clusters
+- log_mood_event(...) → logs detected moods to CSV
+- log_feedback_event(...) → logs like/skip/save feedback to CSV
 """
 
 import os
 import ast
+import csv
 import random
+from datetime import datetime
+from typing import Optional
+
 import numpy as np
 import pandas as pd
-from transformers import pipeline
 import joblib
 
-# --- Load precomputed artifacts (vectorizer, similarity matrix, movies) ---
+# HuggingFace pipeline is optional (safe fallback)
+# ---------------------------
+# Emotion pipeline (optional) and helper
+# ---------------------------
+try:
+    from transformers import pipeline
+    # Use return_all_scores=True so we can always pick the top label safely
+    emotion_pipeline = pipeline(
+        "text-classification",
+        model="j-hartmann/emotion-english-distilroberta-base",
+        return_all_scores=True
+    )
+except Exception:
+    emotion_pipeline = None
 
-MODELS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "models")
-MODELS_DIR = os.path.abspath(MODELS_DIR)
+# Map HF labels to coarse moods (you already defined emotion_to_mood_map above — keep it)
+# emotion_to_mood_map = {
+#     "joy": "happy", "love": "happy", "optimism": "happy",
+#     "anger": "angry", "sadness": "sad", "fear": "fear",
+#     "surprise": "surprise", "neutral": "neutral",
+#     "disgust": "neutral",  # optional mapping if you keep 'disgust'
+# }
+
+def _extract_top_dict(results):
+    """
+    Normalize HF pipeline outputs:
+    - results can be list[dict] or list[list[dict]]
+    Return the dict with the max 'score', or None.
+    """
+    try:
+        if not results:
+            return None
+        # Case A: [[{label, score}, ...]]
+        if isinstance(results, list) and results and isinstance(results[0], list):
+            candidates = results[0]
+        # Case B: [{label, score}, ...]
+        elif isinstance(results, list) and results and isinstance(results[0], dict):
+            candidates = results
+        else:
+            return None
+        return max(candidates, key=lambda d: d.get("score", 0.0))
+    except Exception:
+        return None
+
+
+# -------------------------------------------------------------------
+# Paths for models and data (Harsha)
+# -------------------------------------------------------------------
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+DATA_DIR   = os.path.join(BASE_DIR, "data")
+
+os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 
 TFIDF_VECTORIZER_PATH = os.path.join(MODELS_DIR, "tfidf_vectorizer.pkl")
 COSINE_SIM_MATRIX_PATH = os.path.join(MODELS_DIR, "cosine_sim_matrix.npy")
 MOVIES_DF_PATH = os.path.join(MODELS_DIR, "loaded_movies_df.csv")
+KMEANS_MODEL_PATH = os.path.join(MODELS_DIR, "kmeans_vibe_model.pkl")
 
-# Load TF-IDF vectorizer (kept for future use / compatibility)
-tfidf_vectorizer = joblib.load(TFIDF_VECTORIZER_PATH)
+# CSV logs
+USER_MOODS_LOG    = os.path.join(DATA_DIR, "user_moods.csv")
+USER_FEEDBACK_LOG = os.path.join(DATA_DIR, "user_feedback.csv")
 
-# Load cosine similarity matrix
-cosine_sim_matrix = np.load(COSINE_SIM_MATRIX_PATH)
 
-# Load movies with ratings
+# -------------------------------------------------------------------
+# Load model artifacts (safe fallback version)
+# -------------------------------------------------------------------
+
+# 1) TF-IDF vectorizer
+try:
+    tfidf_vectorizer = joblib.load(TFIDF_VECTORIZER_PATH)
+except Exception:
+    tfidf_vectorizer = None
+
+# 2) Movie dataframe (required)
+if not os.path.exists(MOVIES_DF_PATH):
+    raise FileNotFoundError(f"[ERROR] Movies dataframe not found at {MOVIES_DF_PATH}")
+
 movies_df = pd.read_csv(MOVIES_DF_PATH)
 
-# Ensure genres are a proper Python list
+# 3) Cosine similarity matrix
+try:
+    cosine_sim_matrix = np.load(COSINE_SIM_MATRIX_PATH)
+except Exception:
+    n = len(movies_df)
+    cosine_sim_matrix = np.eye(n, dtype=float)  # fallback identity
+
+# 4) KMeans model (optional)
+try:
+    kmeans_model = joblib.load(KMEANS_MODEL_PATH)
+except Exception:
+    kmeans_model = None
+
+
+# -------------------------------------------------------------------
+# Data cleaning helpers (Harsha)
+# -------------------------------------------------------------------
+
 def _ensure_genres_list(val):
+    """Ensure genres column is a Python list."""
     if isinstance(val, list):
         return val
     if isinstance(val, str) and val.startswith("[") and "]" in val:
@@ -49,379 +137,270 @@ def _ensure_genres_list(val):
         return val.split("|")
     return []
 
-if "genres" in movies_df.columns:
-    movies_df["genres"] = movies_df["genres"].apply(_ensure_genres_list)
+if "genres_list" in movies_df.columns:
+    movies_df["genres_list"] = movies_df["genres_list"].apply(_ensure_genres_list)
+elif "genres" in movies_df.columns:
+    movies_df["genres_list"] = movies_df["genres"].apply(_ensure_genres_list)
 
-# Ensure vibe_cluster column exists and is integer (for KMeans clustering)
-if "vibe_cluster" in movies_df.columns:
-    movies_df["vibe_cluster"] = movies_df["vibe_cluster"].fillna(-1).astype(int)
-else:
+if "vibe_cluster" not in movies_df.columns:
     movies_df["vibe_cluster"] = -1
+else:
+    movies_df["vibe_cluster"] = movies_df["vibe_cluster"].fillna(-1).astype(int)
 
-# --- Emotion model and mapping ---
 
-# Pretrained HuggingFace model for emotion classification
-emotion_pipeline = pipeline(
-    "text-classification",
-    model="j-hartmann/emotion-english-distilroberta-base"
-)
-
-# Map fine-grained emotions → 6 Vyber moods
-emotion_to_mood_map = {
-    "joy": "happy",
-    "optimism": "happy",
-    "admiration": "happy",
-    "amusement": "happy",
-    "surprise": "happy",
-    "trust": "happy",
-    "contentment": "happy",
-    "love": "romantic",
-    "caring": "romantic",
-    "sadness": "sad",
-    "grief": "sad",
-    "disappointment": "sad",
-    "anger": "action",
-    "annoyance": "action",
-    "disgust": "scary",
-    "fear": "scary",
-    "nervousness": "scary",
-    "anticipation": "fantasy",
-    "curiosity": "fantasy",
-    "excitement": "fantasy",
-}
-
-# Fallback if nothing matches
-DEFAULT_MOOD = "happy"
-
-# Mood → genres mapping
-mood_to_genres_map = {
-    "happy": ["Comedy", "Family", "Animation", "Romance"],
-    "sad": ["Drama"],
-    "romantic": ["Romance"],
-    "action": ["Action", "Adventure", "Crime", "Sci-Fi"],
-    "scary": ["Horror", "Thriller"],
-    "fantasy": ["Fantasy", "Sci-Fi", "Adventure"]
-}
+# -------------------------------------------------------------------
+# Core functions exposed to frontend
+# -------------------------------------------------------------------
 
 def load_movies():
-    """Return the full movies DataFrame used by the recommender."""
+    """Return a copy of the loaded movies dataframe."""
     return movies_df.copy()
 
-# --- Helpers for emotion detection & explanations ---
+DEFAULT_MOOD = "neutral"
 
-def _extract_top_dict(results):
-    """Safely pull out the top {label, score} dict from any nested list structure."""
-    obj = results
-    if isinstance(obj, dict):
-        return obj
-    while isinstance(obj, list) and len(obj) > 0:
-        obj = obj[0]
-        if isinstance(obj, dict):
-            return obj
-    return None
+# If you already defined emotion_to_mood_map above, we will reuse it.
+# If not, uncomment this map:
+# emotion_to_mood_map = {
+#     "joy": "happy", "love": "happy", "optimism": "happy",
+#     "anger": "angry", "sadness": "sad", "fear": "fear",
+#     "surprise": "surprise", "neutral": "neutral",
+#     "disgust": "neutral",
+# }
 
+# ---------------------------
+# Logging helpers (Harsha)
+# ---------------------------
 
-def detect_mood(text: str) -> str:
-    """Detect a coarse mood (one of 6) from free-text input.
+def _append_csv_row(path: str, header: list, row: list) -> None:
+    file_exists = os.path.exists(path)
+    with open(path, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(header)
+        writer.writerow(row)
 
-    Handles different output shapes from the HuggingFace pipeline.
-    If anything goes wrong, returns DEFAULT_MOOD.
+def log_mood_event(
+    session_id: str,
+    source: str,
+    mood: str,
+    raw_text: Optional[str] = None,
+    detected_label: Optional[str] = None,
+    score: Optional[float] = None,
+) -> None:
+    ts = datetime.utcnow().isoformat()
+    _append_csv_row(
+        USER_MOODS_LOG,
+        header=["timestamp_utc", "session_id", "source", "mood", "raw_text", "detected_label", "score"],
+        row=[ts, session_id, source, mood, raw_text or "", detected_label or "", score if score is not None else ""],
+    )
+
+def log_feedback_event(session_id: str, movie_title: str, mood: str, action: str) -> None:
+    ts = datetime.utcnow().isoformat()
+    _append_csv_row(
+        USER_FEEDBACK_LOG,
+        header=["timestamp_utc", "session_id", "movie_title", "mood", "action"],
+        row=[ts, session_id, movie_title, mood, action],
+    )
+
+# ---------------------------
+# Mood detection
+# ---------------------------
+
+def detect_mood(text: str, session_id: Optional[str] = None) -> str:
+    """
+    Detect a coarse mood from free text.
+    Uses HF pipeline if available; otherwise falls back to a simple heuristic.
+    If session_id is provided, logs the event.
     """
     if not isinstance(text, str) or not text.strip():
-        return DEFAULT_MOOD
+        mood = DEFAULT_MOOD
+        if session_id:
+            log_mood_event(session_id, "ai_detected", mood, raw_text=text)
+        return mood
 
-    try:
-        results = emotion_pipeline(text)
-    except Exception:
-        return DEFAULT_MOOD
+    # Try HF pipeline first
+    if 'emotion_pipeline' in globals() and emotion_pipeline is not None:
+        try:
+            results = emotion_pipeline(text)
+            # _extract_top_dict must exist above – we provided a fixed version earlier
+            top = _extract_top_dict(results)
+            if top:
+                label = str(top.get("label", "")).lower()
+                score = float(top.get("score", 0.0))
+                mood = emotion_to_mood_map.get(label, DEFAULT_MOOD)
+                if session_id:
+                    log_mood_event(session_id, "ai_detected", mood, raw_text=text, detected_label=label, score=score)
+                return mood
+        except Exception:
+            pass
 
-    top = _extract_top_dict(results)
-    if top is None:
-        return DEFAULT_MOOD
+    # Heuristic fallback
+    lowered = text.lower()
+    if any(w in lowered for w in ["happy", "glad", "joy", "awesome", "good", "great", "love", "excited"]):
+        mood = "happy"
+    elif any(w in lowered for w in ["sad", "unhappy", "depress", "lonely", "down"]):
+        mood = "sad"
+    elif any(w in lowered for w in ["angry", "mad", "furious", "annoyed"]):
+        mood = "angry"
+    elif any(w in lowered for w in ["scared", "afraid", "fear", "terrified"]):
+        mood = "fear"
+    elif any(w in lowered for w in ["surprise", "shocked", "wow", "amazed"]):
+        mood = "surprise"
+    elif any(w in lowered for w in ["calm", "relaxed", "chill"]):
+        mood = "calm"
+    else:
+        mood = DEFAULT_MOOD
 
-    label = str(top.get("label", "")).lower()
-    mood = emotion_to_mood_map.get(label, DEFAULT_MOOD)
+    if session_id:
+        log_mood_event(session_id, "ai_detected", mood, raw_text=text)
     return mood
 
+# ---------------------------
+# Recommendation
+# ---------------------------
 
-def build_explanation(
-    title: str,
-    mood: str,
-    genres_list,
-    avg_rating: float = None,
-    rank: int = 1,
-    user_text: str = None,
-) -> str:
-    """Generate a natural-language explanation for a recommendation."""
-
-    mood = (mood or "").lower()
-
-    # Genre phrase
-    if genres_list:
-        main_genre = genres_list[0]
-        if len(genres_list) == 1:
-            genre_phrase = f"{main_genre} movie"
-        else:
-            others = ", ".join(genres_list[1:])
-            genre_phrase = f"{main_genre} movie with {others} elements"
-    else:
-        genre_phrase = "movie"
-
-    # Rating phrase
-    if avg_rating is not None:
-        rating_phrase = f", rated about {avg_rating:.1f} by other viewers"
-    else:
-        rating_phrase = ""
-
-    # Rank phrase
-    if rank == 1:
-        rank_phrase = " as a top pick for your mood"
-    elif rank == 2:
-        rank_phrase = " as another strong choice"
-    elif rank == 3:
-        rank_phrase = " as a good option to try next"
-    else:
-        rank_phrase = ""
-
-    # Optional snippet from user text
-    snippet = None
-    if isinstance(user_text, str) and user_text.strip():
-        cleaned = " ".join(user_text.strip().split())
-        if len(cleaned) > 80:
-            cleaned = cleaned[:77] + "..."
-        snippet = cleaned
-
-    # Template variations 
-    templates = [
-        "Since your mood is {mood}, we picked {title}, a {genre_phrase}{rating_phrase}{rank_phrase}.",
-        "Because you are feeling {mood}, {title} — a {genre_phrase}{rating_phrase} — should fit your vibe{rank_phrase}.",
-        "To go with your {mood} mood, we suggest {title}, which is a {genre_phrase}{rating_phrase}{rank_phrase}.",
-        "For this {mood} mood, {title} stands out as a {genre_phrase}{rating_phrase}{rank_phrase}.",
-        "Given that you are feeling {mood}, {title} is a {genre_phrase} that many people enjoy{rating_phrase}{rank_phrase}.",
-        "We matched your {mood} mood with {title}, a {genre_phrase}{rating_phrase}{rank_phrase}.",
-    ]
-
-    if snippet:
-        templates.extend([
-            'You mentioned "{snippet}", so we chose {title}, a {genre_phrase}{rating_phrase}{rank_phrase}.',
-            'Based on what you said ("{snippet}"), {title} — a {genre_phrase}{rating_phrase} — should suit your mood{rank_phrase}.',
-        ])
-
-    template = random.choice(templates)
-
-    explanation = template.format(
-        mood=mood,
-        title=title,
-        genre_phrase=genre_phrase,
-        rating_phrase=rating_phrase,
-        rank_phrase=rank_phrase,
-        snippet=snippet or "",
-    )
-
-    return explanation
-
-
-#Recommendation logic
-
-def recommend(
-    mood: str,
-    top_n: int = 5,
-    weight_sim: float = 0.7,
-    weight_rating: float = 0.3,
-    user_text: str = None,
-):
-    """Recommend movies for a given mood.
-
-    Combines cosine similarity (based on title + genres)
-    and average rating to score movies, then returns a list
-    of dicts with title, genres, mood, rating, vibe_cluster, explanation.
-    """
-    mood = (mood or "").lower()
-    if mood not in mood_to_genres_map:
-        mood = DEFAULT_MOOD
-
-    target_genres = mood_to_genres_map[mood]
-
-    # Simple genre filter: keep movies that contain at least one target genre
-    def has_genre(genres):
-        if not isinstance(genres, (list, tuple, set)):
-            return False
-        genres_lower = [str(g).lower() for g in genres]
-        return any(tg.lower() in genres_lower for tg in target_genres)
-
-    mask = movies_df["genres"].apply(has_genre)
-    candidate_indices = movies_df.index[mask].tolist()
-
-    if not candidate_indices:
-        # Fallback: if no movie matches, just take all movies
-        candidate_indices = list(movies_df.index)
-
-    # Slice similarity matrix & ratings for the candidates
-    sim_submatrix = cosine_sim_matrix[np.ix_(candidate_indices, candidate_indices)]
-
-    # For simplicity, use the average similarity of each candidate to all others
-    sim_scores = sim_submatrix.mean(axis=1)
-
-    # Use avg_rating column if present, else fallback to ones
-    if "avg_rating" in movies_df.columns:
-        ratings = movies_df.loc[candidate_indices, "avg_rating"].values
-    else:
-        ratings = np.ones(len(candidate_indices))
-
-    # Normalize scores to [0,1] to combine them
-    def _normalize(x):
-        x = np.asarray(x, dtype=float)
-        if x.max() == x.min():
-            return np.ones_like(x)
-        return (x - x.min()) / (x.max() - x.min())
-
-    sim_norm = _normalize(sim_scores)
-    rating_norm = _normalize(ratings)
-
-    final_scores = weight_sim * sim_norm + weight_rating * rating_norm
-
-    # Sort candidates by score
-    sorted_idx = np.argsort(final_scores)[::-1]  # descending
-    top_idx = sorted_idx[:top_n]
-
-    top_movie_indices = [candidate_indices[i] for i in top_idx]
-    top_movies = movies_df.loc[top_movie_indices]
-
-    results = []
-    for rank, (_, row) in enumerate(top_movies.iterrows(), start=1):
-        genres_val = row.get("genres", [])
-        if isinstance(genres_val, str):
-            try:
-                parsed = ast.literal_eval(genres_val)
-                if isinstance(parsed, list):
-                    genres_val = parsed
-                else:
-                    genres_val = [genres_val]
-            except Exception:
-                genres_val = [genres_val]
-        elif not isinstance(genres_val, (list, tuple, set)):
-            genres_val = [str(genres_val)]
-
-        genres_list = [str(g) for g in genres_val if g is not None]
-
-        avg_rating = None
-        if "avg_rating" in row and not pd.isna(row["avg_rating"]):
-            avg_rating = float(row["avg_rating"])
-
-        explanation = build_explanation(
-            title=row["title"],
-            mood=mood,
-            genres_list=genres_list,
-            avg_rating=avg_rating,
-            rank=rank,
-            user_text=user_text,
-        )
-
-        # Safe handling for vibe_cluster from the dataframe
-        if "vibe_cluster" in row:
-            vibe_val = row["vibe_cluster"]
-        else:
-            vibe_val = None
-
-        try:
-            vibe_cluster = int(vibe_val) if vibe_val is not None and not pd.isna(vibe_val) else None
-        except Exception:
-            vibe_cluster = None
-
-        results.append({
-            "title": row["title"],
-            "genres": genres_list,
-            "mood": mood,
-            "avg_rating": avg_rating,
-            "vibe_cluster": vibe_cluster,
-            "explanation": explanation,
-        })
-
-    return results
-
-
-def surprise_me(mood: str, user_text: str = None):
-    """
-    Surprise-me recommender that uses mood + vibe clusters.
-
-    - Picks movies for the mood (like recommend)
-    - Tries to choose one from a *different* vibe_cluster than the main top picks
-      so it feels fresh but still relevant.
-    """
-
-    # Normalize mood
-    mood = (mood or "").lower()
-    if mood not in mood_to_genres_map:
-        mood = DEFAULT_MOOD
-
-    # 1) Use existing recommend() to see the main clusters
-    base_recs = recommend(mood=mood, top_n=5, user_text=user_text)
-    base_clusters = {
-        r.get("vibe_cluster")
-        for r in base_recs
-        if r.get("vibe_cluster") is not None
-    }
-
-    # 2) Build candidate set: same mood’s genre filter
-    target_genres = mood_to_genres_map[mood]
-
-    def has_genre(genres):
-        if not isinstance(genres, (list, tuple, set)):
-            return False
-        genres_lower = [str(g).lower() for g in genres]
-        return any(tg.lower() in genres_lower for tg in target_genres)
-
-    mask = movies_df["genres"].apply(has_genre)
-    candidates_df = movies_df[mask].copy()
-    if candidates_df.empty:
-        candidates_df = movies_df.copy()
-
-    # 3) Prefer movies from a *different* vibe_cluster than main recs
-    if "vibe_cluster" in candidates_df.columns and base_clusters:
-        alt_candidates = candidates_df[~candidates_df["vibe_cluster"].isin(base_clusters)]
-        if not alt_candidates.empty:
-            candidates_df = alt_candidates
-
-    # 4) Randomly pick ONE surprise movie
-    surprise_row = candidates_df.sample(n=1, random_state=None).iloc[0]
-
-    # 5) Clean genres to a list of strings
-    genres_val = surprise_row.get("genres", [])
-    if isinstance(genres_val, str):
-        try:
-            parsed = ast.literal_eval(genres_val)
-            if isinstance(parsed, list):
-                genres_val = parsed
-            else:
-                genres_val = [genres_val]
-        except Exception:
-            genres_val = [genres_val]
-    elif not isinstance(genres_val, (list, tuple, set)):
-        genres_val = [str(genres_val)]
-
-    genres_list = [str(g) for g in genres_val if g is not None]
-
-    # 6) Get rating
-    avg_rating = None
-    if "avg_rating" in surprise_row and not pd.isna(surprise_row["avg_rating"]):
-        avg_rating = float(surprise_row["avg_rating"])
-
-    # 7) Reuse explanation system
-    explanation = build_explanation(
-        title=surprise_row["title"],
-        mood=mood,
-        genres_list=genres_list,
-        avg_rating=avg_rating,
-        rank=1,
-        user_text=user_text,
-    )
-
-    # 8) Return a single movie dict
+def _row_to_public(idx: int) -> dict:
+    row = movies_df.iloc[idx]
     return {
-        "title": surprise_row["title"],
-        "genres": genres_list,
-        "mood": mood,
-        "avg_rating": avg_rating,
-        "vibe_cluster": int(surprise_row["vibe_cluster"]) if "vibe_cluster" in surprise_row else None,
-        "explanation": explanation,
+        "index": int(idx),
+        "title": row.get("title", ""),
+        "genres": row.get("genres_list", row.get("genres", [])),
+        "avg_rating": float(row.get("avg_rating", 0.0)),
+        "vibe_cluster": int(row.get("vibe_cluster", -1)),
     }
+
+def recommend(mood: str, top_n: int = 10, user_text: Optional[str] = None) -> list[dict]:
+    """
+    Rank movies using:
+      - cosine_sim_matrix row sums (popularity/centrality proxy),
+      - avg_rating,
+      - simple mood->genre boosts.
+    Works even if cosine matrix is identity (fallback).
+    """
+    n = len(movies_df)
+    scores = np.zeros(n, dtype=float)
+
+    # 1) cosine popularity proxy
+    try:
+        sim_sums = np.nan_to_num(cosine_sim_matrix.sum(axis=1))
+        if sim_sums.shape[0] == n:
+            scores += sim_sums
+    except Exception:
+        pass
+
+    # 2) avg_rating boost
+    try:
+        ratings = movies_df["avg_rating"].fillna(movies_df["avg_rating"].mean()).to_numpy()
+        scores += (ratings - ratings.mean()) * 0.5
+    except Exception:
+        pass
+
+    # 3) mood-genre boost
+    mood_genres = {
+        "happy": ["comedy", "romance", "family"],
+        "sad": ["drama", "romance"],
+        "angry": ["action", "thriller"],
+        "fear": ["horror", "thriller"],
+        "surprise": ["mystery", "sci-fi", "fantasy"],
+        "calm": ["documentary", "drama"],
+        "excited": ["action", "adventure"],
+        "neutral": [],
+    }
+    boosts = set([g.lower() for g in mood_genres.get(mood, [])])
+    if boosts:
+        for i in range(n):
+            gs = movies_df.iloc[i].get("genres_list", movies_df.iloc[i].get("genres", []))
+            gs_norm = " ".join([str(x).lower() for x in (gs if isinstance(gs, list) else [gs])])
+            if any(b in gs_norm for b in boosts):
+                scores[i] += 1.0
+
+    # sort and build output
+    order = np.argsort(-scores)
+    out = []
+    seen = set()
+    for idx in order:
+        if len(out) >= int(top_n):
+            break
+        item = _row_to_public(int(idx))
+        t = item["title"]
+        if t and t not in seen:
+            seen.add(t)
+            out.append(item)
+    return out
+
+# ---------------------------
+# Surprise Me
+# ---------------------------
+
+def surprise_me(mood: str, user_text: Optional[str] = None) -> dict | None:
+    """
+    Return one movie from a *different* vibe cluster than the dominant
+    cluster in the main recommendations. Falls back gracefully.
+    """
+    recs = recommend(mood, top_n=30, user_text=user_text)
+    if not recs:
+        # fallback to a mid-rated movie
+        row = movies_df.sort_values("avg_rating").iloc[len(movies_df) // 2]
+        return _row_to_public(int(row.name))
+
+    # find most common cluster in recs
+    counts = {}
+    for r in recs:
+        c = int(r.get("vibe_cluster", -1))
+        counts[c] = counts.get(c, 0) + 1
+    dominant = max(counts.items(), key=lambda kv: kv[1])[0]
+
+    # pick from different cluster if possible
+    diff = [r for r in recs if int(r.get("vibe_cluster", -1)) not in (dominant, -1)]
+    if diff:
+        return random.choice(diff)
+
+    # else sample from full dataset in other clusters
+    alt = movies_df[movies_df["vibe_cluster"] != dominant]
+    if not alt.empty:
+        alt_top = alt.sort_values("avg_rating", ascending=False).head(100)
+        row = alt_top.sample(1).iloc[0]
+        return _row_to_public(int(row.name))
+
+    # final fallback
+    return random.choice(recs) if recs else None
+
+
+# ---------------------------
+# Emotion pipeline (optional) and helper
+# ---------------------------
+try:
+    from transformers import pipeline
+    emotion_pipeline = pipeline(
+        "text-classification",
+        model="j-hartmann/emotion-english-distilroberta-base",
+        return_all_scores=True
+    )
+except Exception:
+    emotion_pipeline = None
+
+def _extract_top_dict(results):
+    """
+    Normalize HF pipeline outputs.
+    - results can be list[dict] or list[list[dict]]
+    Returns the dict with the highest 'score'.
+    """
+    try:
+        if not results:
+            return None
+
+        # Case A: nested list form
+        if isinstance(results, list) and isinstance(results[0], list):
+            candidates = results[0]
+
+        # Case B: flat list of dicts
+        elif isinstance(results, list) and isinstance(results[0], dict):
+            candidates = results
+
+        else:
+            return None
+
+        return max(candidates, key=lambda d: d.get("score", 0.0))
+
+    except Exception:
+        return None
