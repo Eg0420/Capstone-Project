@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 from transformers import pipeline
 import joblib
+from personalization.context import build_context
+from personalization.ranker import apply_context_boost
 
 # --- Load precomputed artifacts (vectorizer, similarity matrix, movies) ---
 
@@ -229,6 +231,7 @@ def recommend(
     weight_sim: float = 0.7,
     weight_rating: float = 0.3,
     user_text: str = None,
+    viewing_mode: str = "solo",
 ):
     """Recommend movies for a given mood.
 
@@ -239,7 +242,7 @@ def recommend(
     mood = (mood or "").lower()
     if mood not in mood_to_genres_map:
         mood = DEFAULT_MOOD
-
+    ctx = build_context(viewing_mode)
     target_genres = mood_to_genres_map[mood]
 
     # Simple genre filter: keep movies that contain at least one target genre
@@ -279,6 +282,13 @@ def recommend(
     rating_norm = _normalize(ratings)
 
     final_scores = weight_sim * sim_norm + weight_rating * rating_norm
+
+    # Add context-aware boost per movie
+    boosts = movies_df.loc[candidate_indices, "genres"].apply(
+        lambda g: apply_context_boost(g if isinstance(g, list) else [], ctx)
+        ).values
+
+    final_scores = final_scores + boosts
 
     # Sort candidates by score
     sorted_idx = np.argsort(final_scores)[::-1]  # descending
