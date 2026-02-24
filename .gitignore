@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+
+# Analytics logs
+main/analytics/events.csv
+
+# Model artifacts
+main/models/*.npy
+main/models/*.pkl
+
+# Jupyter checkpoints
+.ipynb_checkpoints/

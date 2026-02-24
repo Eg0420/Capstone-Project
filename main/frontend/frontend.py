@@ -8,7 +8,8 @@ if str(MAIN_DIR) not in sys.path:
     sys.path.insert(0, str(MAIN_DIR))
 
 from backend.ai.emotion_detection import load_movies, detect_mood, recommend, surprise_me
-
+from analytics.logger import log_event
+from analytics.dashboard import show_dashboard
 from typing import List, Dict, Any
 import streamlit as st
 import pandas as pd
@@ -115,6 +116,12 @@ def get_movies_df() -> pd.DataFrame:
 
 MOVIES_DF = get_movies_df()
 
+# ---------- SESSION STATE ----------
+if "chosen_mood_code" not in st.session_state:
+    st.session_state.chosen_mood_code = None
+
+if "user_text" not in st.session_state:
+    st.session_state.user_text = ""
 
 # ---------- MOOD LABELS FOR UI ----------
 MOOD_LABELS = {
@@ -162,152 +169,148 @@ with title_col:
         unsafe_allow_html=True,
     )
 
+# ---------- TABS ----------
+tabs = st.tabs(["🎬 Recommender", "📊 Analytics"])
 
-# ---------- SIDEBAR CONTROLS ----------
-#with st.sidebar:
- #st.header("⚙️ Settings")
+# ---------- RECOMMENDER TAB ----------
+with tabs[0]:
+    top_n = st.slider("Number of recommendations", min_value=3, max_value=15, value=6)
 
-top_n = st.slider("Number of recommendations", min_value=3, max_value=15, value=6)
-show_raw = st.checkbox("Show raw recommendation table (for debugging)", value=False)
+    st.subheader("1. Tell us your vibe")
 
-#st.markdown("---")
-#st.caption(
- #       "This UI directly uses the Vyber recommender utilities:\n"
-  #      "- `detect_mood(text)` → infer mood from text\n"
-    #    "- `recommend(mood, ...)` → ranked list of movies\n"
-     #   "- `surprise_me(mood, ...)` → one offbeat pick"
-    #)
+    mode = st.radio(
+        "How would you like to set your mood?",
+        options=["🧠 Type how you feel", "🎭 Choose my mood"],
+        horizontal=True,
+        index=None
+    )
 
+    # local inputs (session_state holds the "remembered" values)
+    user_text = ""
 
-# ---------- MAIN INPUT AREA ----------
-st.subheader("1. Tell us your vibe")
-
-mode = st.radio(
-    "How do you want to set your mood?",
-    options=["🧠 Let AI detect from my text", "🎛️ Pick mood manually"],
-    horizontal=True,
-)
-
-col_left, col_right = st.columns(2)
-
-detected_mood_code = None
-
-with col_left:
-    if mode.startswith("🧠"):
+    if mode == "🧠 Type how you feel":
         user_text = st.text_area(
             "Describe how you're feeling today (1–2 sentences)",
             placeholder="Example: I'm exhausted but I want something light and funny to relax with.",
             height=120,
         )
+
         detect_btn = st.button("🔍 Detect my mood")
         if detect_btn and user_text.strip():
             with st.spinner("Analyzing your text and detecting mood..."):
                 try:
                     detected_mood_code = detect_mood(user_text)
+                    log_event("mood_detected", {"mood": detected_mood_code})
+
                     st.success(f"Detected mood: **{mood_code_to_label(detected_mood_code)}**")
+
+                    st.session_state.chosen_mood_code = (detected_mood_code or "").strip().lower()
+                    st.session_state.user_text = user_text
                 except Exception as e:
                     st.error(f"Could not detect mood: {e}")
-    else:
-        user_text = st.text_area(
-            "Optional: What kind of movie are you in the mood for?",
-            placeholder="Example: short feel-good romance, minimal violence, comfort watch.",
-            height=120,
+
+    elif mode == "🎭 Choose my mood":
+        st.markdown("#### Select your current mood")
+        mood_label = st.radio(
+            " ",
+            options=[MOOD_LABELS[m] for m in MOOD_ORDER],
+            horizontal=True,
         )
 
-with col_right:
-    st.markdown("#### Or choose a mood directly")
+        chosen_mood_code = mood_label_to_code(mood_label)
 
-    default_label = MOOD_LABELS["happy"]
-    if detected_mood_code:
-        default_label = MOOD_LABELS.get(detected_mood_code, default_label)
+        st.session_state.chosen_mood_code = (chosen_mood_code or "").strip().lower()
+        st.session_state.user_text = ""
 
-    mood_label = st.select_slider(
-        "Select mood",
-        options=[MOOD_LABELS[m] for m in MOOD_ORDER],
-        value=default_label,
-    )
-    chosen_mood_code = mood_label_to_code(mood_label)
+    st.markdown("---")
 
-st.markdown("---")
+    # ---------- ACTION BUTTONS ----------
+    col_rec, col_surprise = st.columns([2, 1])
+    with col_rec:
+        rec_btn = st.button("✨ Get recommendations", use_container_width=True)
+    with col_surprise:
+        surprise_btn = st.button("🎲 Surprise me", use_container_width=True)
 
-# ---------- ACTION BUTTONS ----------
-col_rec, col_surprise = st.columns([2, 1])
-with col_rec:
-    rec_btn = st.button("✨ Get recommendations", use_container_width=True)
-with col_surprise:
-    surprise_btn = st.button("🎲 Surprise me", use_container_width=True)
+    # ---------- MOVIE CARD RENDERER ----------
+    def render_movie_card(movie: Dict[str, Any], rank: int):
+        title = movie.get("title", "Unknown title")
+        genres = movie.get("genres", [])
+        avg_rating = movie.get("avg_rating", None)
+        vibe_cluster = movie.get("vibe_cluster", None)
+        explanation = movie.get("explanation", "")
 
+        badges = []
+        if isinstance(genres, (list, tuple)):
+            badges.append(" | ".join(genres[:3]))
+        if avg_rating is not None:
+            badges.append(f"⭐ {avg_rating:.1f}/5")
+        if vibe_cluster is not None:
+            badges.append(f"Vibe cluster #{vibe_cluster}")
 
-# ---------- RECOMMENDATIONS DISPLAY ----------
-def render_movie_card(movie: Dict[str, Any], rank: int):
-    """
-    movie is a dict produced by vyber_emotion_utils.recommend() / surprise_me(),
-    expected keys: title, genres (list), mood, avg_rating, vibe_cluster, explanation.
-    """
-    title = movie.get("title", "Unknown title")
-    genres = movie.get("genres", [])
-    mood_code = movie.get("mood", "")
-    avg_rating = movie.get("avg_rating", None)
-    vibe_cluster = movie.get("vibe_cluster", None)
-    explanation = movie.get("explanation", "")
+        badge_text = " • ".join(badges)
 
-    # small badges
-    badges = []
-    if isinstance(genres, (list, tuple)):
-        badges.append(" | ".join(genres[:3]))
-    if avg_rating is not None:
-        badges.append(f"⭐ {avg_rating:.1f}/5")
-    if vibe_cluster is not None:
-        badges.append(f"Vibe cluster #{vibe_cluster}")
-
-    badge_text = " • ".join(badges)
-
-    with st.container():
-        st.markdown(
-            f"### #{rank} – {title}\n"
-            f"<span style='color:#ffaa00;'>{badge_text}</span>",
-            unsafe_allow_html=True,
-        )
-        st.write(explanation)
-        st.markdown("---")
-
-
-recommendations_df = None
-
-if rec_btn:
-    st.subheader("2. Your recommendations")
-
-    with st.spinner("Matching your mood to movies..."):
-        try:
-            raw_recs: List[Dict[str, Any]] = recommend(
-                mood=chosen_mood_code,
-                top_n=top_n,
-                user_text=user_text if isinstance(user_text, str) else None,
+        with st.container():
+            st.markdown(
+                f"### #{rank} – {title}\n"
+                f"<span style='color:#ffaa00;'>{badge_text}</span>",
+                unsafe_allow_html=True,
             )
-            if not raw_recs:
-                st.warning("No recommendations were returned. Try a different mood or check the backend.")
-            else:
-                for i, m in enumerate(raw_recs, start=1):
-                    render_movie_card(m, rank=i)
+            st.write(explanation)
+            st.markdown("---")
 
-                recommendations_df = pd.DataFrame(raw_recs)
-        except Exception as e:
-            st.error(f"Recommendation failed: {e}")
+    # ---------- RECOMMENDATIONS ----------
+    if rec_btn:
+        mood_to_use = st.session_state.chosen_mood_code
+        text_to_use = st.session_state.user_text
 
-if surprise_btn:
-    st.subheader("🎲 Surprise pick")
+        if not mood_to_use:
+            st.warning("Please choose a mood first (type + detect OR choose manually).")
+            st.stop()
 
-    with st.spinner("Picking something a little different but still on-vibe..."):
-        try:
-            surprise_movie = surprise_me(
-                mood=chosen_mood_code,
-                user_text=user_text if isinstance(user_text, str) else None,
-            )
-            render_movie_card(surprise_movie, rank=1)
-        except Exception as e:
-            st.error(f"Surprise-me failed: {e}")
+        log_event("recommendation_requested", {"mood": mood_to_use, "top_n": top_n})
+        st.subheader("2. Your recommendations")
+        st.caption(f"Using mood: {mood_to_use}")
 
-# ---------- DEBUG / RAW TABLE ----------
-if show_raw and recommendations_df is not None:
-    st.markdown("### Debug – raw recommendation data")
-    st.dataframe(recommendations_df)
+        with st.spinner("Matching your mood to movies..."):
+            try:
+                raw_recs: List[Dict[str, Any]] = recommend(
+                    mood=mood_to_use,
+                    top_n=top_n,
+                    user_text=text_to_use if isinstance(text_to_use, str) else None,
+                )
+
+                if not raw_recs:
+                    st.warning("No recommendations were returned. Try a different mood or check the backend.")
+                else:
+                    for i, m in enumerate(raw_recs, start=1):
+                        render_movie_card(m, rank=i)
+
+            except Exception as e:
+                st.error(f"Recommendation failed: {e}")
+
+    # ---------- SURPRISE ME ----------
+    if surprise_btn:
+        mood_to_use = st.session_state.chosen_mood_code
+        text_to_use = st.session_state.user_text
+
+        if not mood_to_use:
+            st.warning("Please choose a mood first.")
+            st.stop()
+
+        log_event("surprise_clicked", {"mood": mood_to_use})
+        st.subheader("🎲 Surprise pick")
+
+        with st.spinner("Picking something a little different but still on-vibe..."):
+            try:
+                surprise_movie = surprise_me(
+                    mood=mood_to_use,
+                    user_text=text_to_use if isinstance(text_to_use, str) else None,
+                )
+                render_movie_card(surprise_movie, rank=1)
+            except Exception as e:
+                st.error(f"Surprise-me failed: {e}")
+
+
+# ---------- ANALYTICS TAB ----------
+with tabs[1]:
+    show_dashboard()
