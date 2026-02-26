@@ -240,6 +240,7 @@ with tabs[0]:
                 with st.spinner("Analyzing your text..."):
                     try:
                         detected = detect_mood(user_text)
+                        log_event("mood_selected", {"mood": mood})
                         log_event("mood_detected", {"mood": detected})
                         st.success(f"Detected mood: **{mood_code_to_label(detected)}**")
                         st.session_state.chosen_mood_code = (detected or "").strip().lower()
@@ -298,6 +299,7 @@ with tabs[0]:
             st.stop()
 
         log_event("recommendation_requested", {"mood": mood, "top_n": top_n})
+        log_event("recommendation_shown", {"mood": mood, "count": len(recommendations)})
 
         st.subheader("2. Your recommendations")
         st.caption(f"Using mood: {mood}")
