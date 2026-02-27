@@ -1,11 +1,13 @@
 import sys
 from pathlib import Path
 import os
-from typing import List, Dict, Any
+from typing import Dict, Any
 import base64
-
+import uuid
+import html
 import streamlit as st
 import pandas as pd
+import re
 
 CURRENT_FILE = Path(__file__).resolve()
 MAIN_DIR = CURRENT_FILE.parents[1]
@@ -16,6 +18,29 @@ from backend.ai.emotion_detection import load_movies, detect_mood, recommend, su
 from analytics.logger import log_event
 from analytics.dashboard import show_dashboard
 
+# --- SESSION TRACKING ---
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+
+def is_gibberish(text: str) -> bool:
+    t = (text or "").strip()
+    if len(t) < 6:
+        return True
+
+    letters = sum(ch.isalpha() for ch in t)
+    if letters / max(len(t), 1) < 0.6:
+        return True
+
+    if len(set(t.lower())) <= 2 and len(t) >= 8:
+        return True
+
+    if not re.search(r"[aeiouAEIOU]", t):
+        return True
+
+    if " " not in t and len(t) > 12:
+        return True
+
+    return False
 
 # ==========================================================
 # BACKGROUND + GLOBAL UI STYLING
@@ -57,7 +82,6 @@ def set_background():
             color: #f5f5f5 !important;
         }}
 
-        /* ---------- FIX: Remove weird empty rounded bar & extra spacing from tabs ---------- */
         hr {{ display: none !important; }}
 
         div[data-testid="stTabs"] {{
@@ -74,7 +98,6 @@ def set_background():
             padding-top: 0.25rem !important;
         }}
 
-        /* ---------- Glass panel wrapper ---------- */
         .vy-panel {{
             max-width: 1050px;
             margin: 0 auto 20px auto;
@@ -87,7 +110,6 @@ def set_background():
             -webkit-backdrop-filter: blur(16px);
         }}
 
-        /* Chips */
         .vy-chip {{
             display:inline-block;
             padding: 6px 12px;
@@ -103,7 +125,6 @@ def set_background():
             font-size: 13px;
         }}
 
-        /* Movie card */
         .vy-card {{
             background: rgba(255,255,255,0.06);
             border: 1px solid rgba(255,255,255,0.12);
@@ -111,6 +132,12 @@ def set_background():
             padding: 14px;
             box-shadow: 0 10px 30px rgba(0,0,0,0.35);
             transition: all 0.25s ease;
+
+            min-height: 360px;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
+
         }}
 
         .vy-card:hover {{
@@ -118,12 +145,61 @@ def set_background():
             box-shadow: 0 14px 40px rgba(0,0,0,0.55);
         }}
 
+        .vy-expl {{
+            display: -webkit-box;
+            -webkit-line-clamp: 4;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+            opacity: 0.95;
+        }}
+
+        .vy-title {{
+            font-size: 28px;
+                font-weight: 900;
+                line-height: 1.15;
+                margin: 2px 0 8px 0;
+                color: #ffffff;
+                text-shadow: 0 3px 16px rgba(0,0,0,0.55);
+            }}
+
+        .vy-title::after {{
+                content: "";
+                display: block;
+                width: 56px;
+                height: 4px;
+                margin-top: 8px;
+                border-radius: 999px;
+                background: rgba(140, 70, 255, 0.75);
+            }}
+
+        .vy-genres {{
+                font-size: 13px;
+                opacity: 0.9;
+                margin-bottom: 6px;
+            }}
+
+        .vy-rating {{
+                font-size: 15px;
+                margin-bottom: 10px;
+            }}
+
         /* Buttons */
         div.stButton > button {{
             border-radius: 12px !important;
             padding: 0.65rem 0.9rem !important;
         }}
 
+        div.stButton > button:hover {{
+        background: rgba(140, 70, 255, 0.35) !important;
+        border: 1px solid rgba(160, 100, 255, 0.65) !important;
+        }}
+
+        div.stButton > button:focus,
+        div.stButton > button:active {{
+            background: rgba(140, 70, 255, 0.45) !important;
+            border: 1px solid rgba(160, 100, 255, 0.85) !important;
+        }}
+        
         </style>
         """,
         unsafe_allow_html=True,
@@ -150,6 +226,14 @@ if "chosen_mood_code" not in st.session_state:
 if "user_text" not in st.session_state:
     st.session_state.user_text = ""
 
+if "feedback" not in st.session_state:
+    st.session_state.feedback = {}
+
+if "mode_action" not in st.session_state:
+    st.session_state.mode_action = None
+
+if "clear_mood_text" not in st.session_state:
+    st.session_state.clear_mood_text = False
 
 # ==========================================================
 # MOODS
@@ -191,9 +275,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# (No st.markdown("---") here — it created extra bar/space)
-
-
 # ==========================================================
 # TABS
 # ==========================================================
@@ -204,10 +285,11 @@ tabs = st.tabs(["🎬 Recommender", "📊 Analytics"])
 # RECOMMENDER TAB
 # ==========================================================
 with tabs[0]:
-
+    if st.session_state.clear_mood_text:
+        if "mood_text" in st.session_state:
+            del st.session_state["mood_text"]
+        st.session_state.clear_mood_text = False
     # ---- ONE SINGLE GLASS PANEL WRAPPER ----
-    st.markdown('<div class="vy-panel">', unsafe_allow_html=True)
-
     st.subheader("1. Tell us your vibe")
     st.caption("Choose one option to set your mood. You can change it anytime.")
 
@@ -216,7 +298,19 @@ with tabs[0]:
         options=["🧠 Type how you feel", "🎭 Choose my mood"],
         horizontal=True,
         index=None,
+        key="mood_mode",
     )
+    if mode is None:
+        st.info("Select a mode above to continue.")
+        st.stop()
+
+    if "prev_mood_mode" not in st.session_state:
+        st.session_state.prev_mood_mode = mode
+
+    if mode != st.session_state.prev_mood_mode:
+        st.session_state.mode_action = None
+        st.session_state.prev_mood_mode = mode
+
 
     # Show current mood chip
     if st.session_state.chosen_mood_code:
@@ -229,77 +323,145 @@ with tabs[0]:
 
     # ---- Mode UI ----
     if mode == "🧠 Type how you feel":
-        user_text = st.text_area(
+        st.text_area(
             "Describe how you're feeling today (1–2 sentences)",
             placeholder="Example: I'm exhausted but I want something light and funny to relax with.",
             height=110,
+            key="mood_text",
         )
+        user_text = st.session_state.get("mood_text", "")
 
-        if st.button("🔍 Detect my mood", use_container_width=True):
-            if user_text.strip():
-                with st.spinner("Analyzing your text..."):
-                    try:
-                        detected = detect_mood(user_text)
-                        log_event("mood_selected", {"mood": mood})
-                        log_event("mood_detected", {"mood": detected})
-                        st.success(f"Detected mood: **{mood_code_to_label(detected)}**")
-                        st.session_state.chosen_mood_code = (detected or "").strip().lower()
-                        st.session_state.user_text = user_text
-                    except Exception as e:
-                        st.error(f"Could not detect mood: {e}")
-            else:
+        if st.button("🔍 Detect my mood", use_container_width=True, key="btn_detect_mood"):
+            if not user_text.strip():
                 st.warning("Please type something first.")
+                st.stop()
+
+            if is_gibberish(user_text):
+                st.error("That looks like random text. Please type a real sentence (e.g., 'I feel tired and want something funny').")
+                log_event("invalid_text_input", {"reason": "gibberish", "session_id": st.session_state.session_id})
+                st.stop()
+
+            with st.spinner("Analyzing your text..."):
+                try:
+                    detected = detect_mood(user_text)
+                    detected = (detected or "").strip().lower()
+
+                    st.session_state.chosen_mood_code = detected
+                    st.session_state.mode_action = None
+                    st.session_state.feedback = {}
+                    log_event("mood_detected", {"mood": detected, "session_id": st.session_state.session_id})
+                    log_event("mood_selected", {"mood": detected, "source": "text_detect", "session_id": st.session_state.session_id})
+                    st.success(f"Detected mood: **{mood_code_to_label(detected)}**")
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Could not detect mood: {e}")
 
     elif mode == "🎭 Choose my mood":
         st.markdown("### Select your current mood")
         mood_cols = st.columns(6)
         for i, mood_code in enumerate(MOOD_ORDER):
             with mood_cols[i]:
-                if st.button(MOOD_LABELS[mood_code], use_container_width=True):
+                if st.button(MOOD_LABELS[mood_code], use_container_width=True, key=f"mood_btn_{mood_code}"):
                     st.session_state.chosen_mood_code = mood_code
-                    st.session_state.user_text = ""
+                    st.session_state.mode_action = None
+                    st.session_state.feedback = {}
+                    st.session_state.clear_mood_text = True                    
+                    log_event("mood_selected", {"mood": mood_code, "source": "manual_select", "session_id": st.session_state.session_id})
+                    st.rerun()
 
     st.markdown("")
 
-    # ---- Controls row inside the SAME container ----
-    c1, c2, c3 = st.columns([1.2, 1, 1])
+    # ---- Controls row ----
+    c1, c2, c3, c4 = st.columns([1.2, 1, 1, 0.7])
     with c1:
-        top_n = st.slider("Results", 3, 15, 6)
+        top_n = st.slider("Results", 3, 15, 6, key="slider_results", label_visibility="visible")
+
     with c2:
-        rec_btn = st.button("✨ Recommend", use_container_width=True)
+        if st.button("✨ Recommend", use_container_width=True, key="btn_recommend"):
+            st.session_state.mode_action = "recommend"
+            st.session_state.feedback = {}
+            st.rerun()
+
     with c3:
-        surprise_btn = st.button("🎲 Surprise", use_container_width=True)
+        if st.button("🎲 Surprise", use_container_width=True, key="btn_surprise"):
+            st.session_state.mode_action = "surprise"
+            st.rerun()
 
-    if st.button("↩ Reset mood", use_container_width=True):
-        st.session_state.chosen_mood_code = None
-        st.session_state.user_text = ""
-
-    st.markdown("</div>", unsafe_allow_html=True)  # end wrapper
-
-    st.markdown("")  # small space after wrapper
-
+    with c4:
+        reset_btn = st.button("↩ Reset", use_container_width=True, key="btn_reset")
+        if reset_btn:
+            st.session_state.chosen_mood_code = None
+            st.session_state.mode_action = None
+            st.session_state.feedback = {}
+            st.session_state.clear_mood_text = True
+            log_event("mood_reset", {"session_id": st.session_state.session_id})
+            st.rerun()
 
     # ---- Movie tile renderer ----
-    def render_movie_tile(movie: Dict[str, Any]):
-        st.markdown('<div class="vy-card">', unsafe_allow_html=True)
-        st.markdown(f"### {movie.get('title', 'Unknown title')}")
-        if movie.get("genres"):
-            st.caption(" • ".join(movie["genres"][:3]))
-        if movie.get("avg_rating") is not None:
-            st.markdown(f"⭐ {float(movie['avg_rating']):.1f}/5")
-        st.write(movie.get("explanation", ""))
-        st.markdown("</div>", unsafe_allow_html=True)
+    def render_movie_tile(movie: Dict[str, Any], idx: int):
+        title = movie.get("title", "Unknown title")
+        genres = " • ".join(movie.get("genres", [])[:3]) if movie.get("genres") else ""
+        rating = movie.get("avg_rating", None)
+        expl = html.escape(movie.get("explanation", "") or "")
 
+        existing = st.session_state.feedback.get(title)
+
+        rating_html = f"<div class='vy-rating'>⭐ {float(rating):.1f}/5</div>" if rating is not None else ""
+        genres_html = f"<div class='vy-genres'>{html.escape(genres)}</div>" if genres else ""
+
+        st.markdown(
+            f"""
+            <div class="vy-card">
+                <div class="vy-title">{html.escape(title)}</div>
+                {genres_html}
+                {rating_html}
+                <div class="vy-expl">{expl}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # Buttons row
+        c_like, c_dislike = st.columns(2)
+        like_label = "👍 Like" if existing != "like" else "✅ Liked"
+        dislike_label = "👎 Dislike" if existing != "dislike" else "✅ Disliked"
+
+        with c_like:
+            if st.button(like_label, use_container_width=True, key=f"like_{idx}", disabled=(existing is not None)):
+                st.session_state.feedback[title] = "like"
+                log_event("feedback_given", {
+                    "movie": title,
+                    "action": "like",
+                    "session_id": st.session_state.session_id
+                })
+                st.toast("Saved: Like ✅")
+                st.rerun()
+
+        with c_dislike:
+            if st.button(dislike_label, use_container_width=True, key=f"dislike_{idx}", disabled=(existing is not None)):
+                st.session_state.feedback[title] = "dislike"
+                log_event("feedback_given", {
+                    "movie": title,
+                    "action": "dislike",
+                    "session_id": st.session_state.session_id
+                })
+                st.toast("Saved: Dislike ✅")
+                st.rerun()
 
     # ---- Recommend ----
-    if rec_btn:
+    if st.session_state.mode_action == "recommend":
         mood = st.session_state.chosen_mood_code
         if not mood:
             st.warning("Please select a mood first (detect or choose).")
             st.stop()
+        typed_text = st.session_state.get("mood_text", "")
 
-        log_event("recommendation_requested", {"mood": mood, "top_n": top_n})
-        log_event("recommendation_shown", {"mood": mood, "count": len(recommendations)})
+        log_event("recommendation_requested", {
+            "mood": mood,
+            "top_n": top_n,
+            "session_id": st.session_state.session_id
+        })
 
         st.subheader("2. Your recommendations")
         st.caption(f"Using mood: {mood}")
@@ -308,8 +470,14 @@ with tabs[0]:
             movies = recommend(
                 mood=mood,
                 top_n=top_n,
-                user_text=st.session_state.user_text,
+                user_text=typed_text,
             )
+
+        log_event("recommendation_shown", {
+            "mood": mood,
+            "count": len(movies) if movies else 0,
+            "session_id": st.session_state.session_id
+        })
 
         if not movies:
             st.warning("No recommendations returned.")
@@ -317,27 +485,36 @@ with tabs[0]:
             cols = st.columns(3)
             for i, m in enumerate(movies):
                 with cols[i % 3]:
-                    render_movie_tile(m)
-
+                    render_movie_tile(m, idx=i)
 
     # ---- Surprise ----
-    if surprise_btn:
+    if st.session_state.mode_action == "surprise":
         mood = st.session_state.chosen_mood_code
         if not mood:
             st.warning("Please select a mood first.")
             st.stop()
+        typed_text = st.session_state.get("mood_text", "")
 
-        log_event("surprise_clicked", {"mood": mood})
+        log_event("surprise_clicked", {
+            "mood": mood,
+            "session_id": st.session_state.session_id
+        })
 
         st.subheader("🎲 Surprise pick")
 
         with st.spinner("Picking a surprise..."):
             movie = surprise_me(
                 mood=mood,
-                user_text=st.session_state.user_text,
+                user_text=typed_text,
             )
 
-        render_movie_tile(movie)
+        log_event("surprise_shown", {
+            "mood": mood,
+            "movie": movie.get("title", "Unknown title") if isinstance(movie, dict) else "Unknown title",
+            "session_id": st.session_state.session_id
+        })
+
+        render_movie_tile(movie, idx=999999)
 
 
 # ==========================================================
